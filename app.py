@@ -41,7 +41,12 @@ ALLOWED_TOKENS = {t.strip() for t in os.environ.get("ALLOWED_TOKENS", "").split(
 # Any OpenAI-compatible chat-completions endpoint (Gemini, Groq, OpenRouter, Ollama ...)
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash-lite")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.5-flash-lite")
+# Comma-separated fallback chain: if one model is overloaded (503) the next one is tried.
+LLM_MODELS = [m.strip() for m in os.environ.get(
+    "LLM_MODELS", LLM_MODEL + ",gemini-3.1-flash-lite,gemini-flash-lite-latest").split(",") if m.strip()]
+# Packages per model call. Small chunks run in parallel, so each call is fast.
+LLM_CHUNK = max(1, int(os.environ.get("LLM_CHUNK", "3")))
 
 # Flip to "1" if the grader's feedback says evidence refs don't match and the
 # documents show refs like "[ABC-1]" that you should return WITH the brackets.
@@ -210,12 +215,12 @@ def build_system_prompt():
     return SYSTEM_PROMPT.replace("{REF_RULE}", rule)
 
 
-def call_llm(system, user, timeout):
+def call_llm(system, user, timeout, model=None):
     url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
     base = {
-        "model": LLM_MODEL,
+        "model": model or LLM_MODEL,
         "temperature": 0,
-        "max_tokens": 8000,
+        "max_tokens": 4000,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
     }
     headers = {
@@ -370,6 +375,39 @@ def pkg_hash(pkg):
     return sha(PROMPT_VERSION + "|" + canon(body))
 
 
+def _decide_chunk(pkgs, idxs, policy_revision, deadline, results, lock):
+    """Decide one small group of packages; retry on overload, rotating through fallback models."""
+    todo = list(idxs)
+    attempt = 0
+    while todo:
+        remaining = deadline - time.time()
+        if remaining < 6:
+            return
+        model = LLM_MODELS[attempt % len(LLM_MODELS)]
+        attempt += 1
+        parts = [f"Policy revision: {policy_revision}\nDecide every package below.\n"]
+        for i in todo:
+            parts.append(f"=== PACKAGE {pkgs[i]['packageId']} ===\n" + json.dumps(pkgs[i], ensure_ascii=False))
+        try:
+            raw = call_llm(build_system_prompt(), "\n".join(parts), timeout=min(remaining - 2, 30), model=model)
+            decs = parse_json_loose(raw).get("decisions", [])
+        except urllib.error.HTTPError as e:
+            log(f"llm http error {e.code} model={model}")
+            time.sleep(min(0.5 * attempt, 2.0))
+            continue
+        except Exception as e:  # noqa
+            log(f"llm error model={model}:", repr(e)[:200])
+            continue
+        by_id = {str(d.get("packageId")): d for d in decs if isinstance(d, dict)}
+        for i in list(todo):
+            v = validate_decision(pkgs[i], by_id.get(pkgs[i]["packageId"]))
+            if v:
+                cache_put(pkg_hash(pkgs[i]), v)
+                with lock:
+                    results[i] = v
+                todo.remove(i)
+
+
 def decide_packages(pkgs, policy_revision, deadline):
     results = {}
     missing = []
@@ -380,30 +418,22 @@ def decide_packages(pkgs, policy_revision, deadline):
         else:
             missing.append(i)
 
-    attempts = 0
-    while missing and attempts < 2:
-        remaining = deadline - time.time()
-        if remaining < 8:
-            break
-        attempts += 1
-        parts = [f"Policy revision: {policy_revision}\nDecide every package below.\n"]
-        for i in missing:
-            parts.append(f"=== PACKAGE {pkgs[i]['packageId']} ===\n" + json.dumps(pkgs[i], ensure_ascii=False))
-        try:
-            raw = call_llm(build_system_prompt(), "\n".join(parts), timeout=min(remaining - 3, 38))
-            decs = parse_json_loose(raw).get("decisions", [])
-        except Exception as e:  # noqa
-            log("llm error:", repr(e)[:300])
-            continue
-        by_id = {str(d.get("packageId")): d for d in decs if isinstance(d, dict)}
-        for i in list(missing):
-            v = validate_decision(pkgs[i], by_id.get(pkgs[i]["packageId"]))
-            if v:
-                cache_put(pkg_hash(pkgs[i]), v)
-                results[i] = v
-                missing.remove(i)
     if missing:
-        raise LLMFailure(f"{len(missing)} packages undecided")
+        lock = threading.Lock()
+        threads = []
+        for k in range(0, len(missing), LLM_CHUNK):
+            chunk = missing[k : k + LLM_CHUNK]
+            t = threading.Thread(
+                target=_decide_chunk, args=(pkgs, chunk, policy_revision, deadline, results, lock), daemon=True
+            )
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(max(deadline - time.time(), 0.1))
+
+    undecided = [i for i in range(len(pkgs)) if i not in results]
+    if undecided:
+        raise LLMFailure(f"{len(undecided)} packages undecided")
     return [results[i] for i in range(len(pkgs))]
 
 
