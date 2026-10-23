@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.db
+*.db-shm
+*.db-wal
+last_batch.json
+msg.json
+msg2.json
